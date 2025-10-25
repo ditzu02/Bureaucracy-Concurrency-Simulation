@@ -31,65 +31,116 @@ public class DocumentManager {
         return new CustomerJourney(customerId, this);
     }
 
-    CompletableFuture<DocumentProcessingResult> requestDocument(CustomerJourney journey, String documentName) {
+    CompletableFuture<DocumentProcessingResult> scheduleDocument(CustomerJourney journey, String documentName) {
         SimulationConfig.DocumentConfig docConfig = Objects.requireNonNull(
                 config.getDocument(documentName),
                 () -> "Unknown document: " + documentName
         );
-
         Office office = Objects.requireNonNull(
                 officesByName.get(docConfig.getIssuingOffice()),
                 () -> "Unknown office: " + docConfig.getIssuingOffice()
         );
+        reporter.customerEvent(journey.getCustomerId(),
+                "queued " + documentName + " at " + office.getName() +
+                        describeDependencies(docConfig.getDependencies()));
+        CompletableFuture<DocumentProcessingResult> resultFuture = new CompletableFuture<>();
+        submitWithRetry(journey, docConfig, office, resultFuture);
+        return resultFuture;
+    }
 
-        IssuanceTask task = new IssuanceTask(journey.getCustomerId(), documentName, () -> {
-            List<String> dependencies = new ArrayList<>();
+    private void submitWithRetry(CustomerJourney journey,
+                                 SimulationConfig.DocumentConfig docConfig,
+                                 Office office,
+                                 CompletableFuture<DocumentProcessingResult> target) {
+        if (target.isDone()) {
+            return;
+        }
+        reporter.officeArrival(office.getName(), journey.getCustomerId(), docConfig.getName());
+        IssuanceTask task = new IssuanceTask(journey.getCustomerId(), docConfig.getName(), () -> {
+            List<String> missing = new ArrayList<>();
             for (String dependency : docConfig.getDependencies()) {
-                log(office.getName(), "Requesting dependency " + dependency + " for customer " + journey.getCustomerId());
-                DocumentProcessingResult dependencyResult = safeJoin(journey.requestDocument(dependency));
-                dependencies.add(dependencyResult.getDocumentName());
+                if (!journey.hasDocument(dependency)) {
+                    missing.add(dependency);
+                }
+            }
+            if (!missing.isEmpty()) {
+                throw new MissingDependenciesException(missing);
             }
             return new DocumentProcessingResult(
                     journey.getCustomerId(),
-                    documentName,
+                    docConfig.getName(),
                     office.getName(),
-                    dependencies,
+                    docConfig.getDependencies(),
                     Duration.ZERO
             );
         });
 
+        CompletableFuture<DocumentProcessingResult> officeFuture;
         try {
-            CompletableFuture<DocumentProcessingResult> future = office.submit(task);
-            future.whenComplete((result, error) -> {
-                if (result != null) {
-                    reporter.documentIssued(result);
-                } else if (error != null) {
-                    reporter.customerEvent(journey.getCustomerId(),
-                            "failed to obtain " + documentName + ": " + error.getMessage());
-                }
-            });
-            return future;
+            officeFuture = office.submit(task);
+            reporter.requestAccepted(office.getName(), journey.getCustomerId(), docConfig.getName());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            CompletableFuture<DocumentProcessingResult> future = new CompletableFuture<>();
-            future.completeExceptionally(e);
-            return future;
+            target.completeExceptionally(e);
+            return;
         }
-    }
 
-    private void log(String office, String message) {
-        reporter.onEvent(office, message);
-    }
-
-    private static DocumentProcessingResult safeJoin(CompletableFuture<DocumentProcessingResult> future) throws Exception {
-        try {
-            return future.join();
-        } catch (CompletionException ex) {
-            if (ex.getCause() instanceof Exception cause) {
-                throw cause;
+        officeFuture.whenComplete((result, error) -> {
+            if (result != null) {
+                reporter.documentIssued(result);
+                target.complete(result);
+                return;
             }
-            throw ex;
+            Throwable cause = (error instanceof CompletionException ce && ce.getCause() != null)
+                    ? ce.getCause()
+                    : error;
+            if (cause instanceof MissingDependenciesException missing) {
+                String reason = "needs " + String.join(", ", missing.getMissing());
+                reporter.cancelEvent(office.getName(), journey.getCustomerId(), docConfig.getName(), reason);
+                reporter.customerEvent(journey.getCustomerId(),
+                        "missing " + String.join(", ", missing.getMissing()) + " before " + docConfig.getName());
+                resolveDependencies(journey, docConfig, missing.getMissing())
+                        .whenComplete((ignored, depError) -> {
+                            if (depError != null) {
+                                target.completeExceptionally(depError);
+                            } else {
+                                submitWithRetry(journey, docConfig, office, target);
+                            }
+                        });
+            } else if (cause != null) {
+                reporter.customerEvent(journey.getCustomerId(),
+                        "failed to obtain " + docConfig.getName() + ": " + cause.getMessage());
+                target.completeExceptionally(cause);
+            } else {
+                target.completeExceptionally(new IllegalStateException("Unknown failure issuing " + docConfig.getName()));
+            }
+        });
+    }
+
+    private CompletableFuture<Void> resolveDependencies(CustomerJourney journey,
+                                                        SimulationConfig.DocumentConfig parentConfig,
+                                                        List<String> dependencies) {
+        CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
+        for (String dependency : dependencies) {
+            SimulationConfig.DocumentConfig dependencyConfig = Objects.requireNonNull(
+                    config.getDocument(dependency),
+                    () -> "Unknown dependency: " + dependency
+            );
+            chain = chain.thenCompose(ignored -> {
+                reporter.customerEvent(journey.getCustomerId(),
+                        "needs dependency " + dependency + " before " + parentConfig.getName());
+                reporter.transportEvent(parentConfig.getIssuingOffice(), dependencyConfig.getIssuingOffice(), dependency);
+                return journey.requestDocument(dependency).thenApply(r -> null);
+            });
         }
+        return chain;
+    }
+
+    private static String describeDependencies(List<String> deps) {
+        if (deps.isEmpty()) {
+            return " (no prerequisites)";
+        }
+        return " (requires: " + String.join(", ", deps) + ")";
     }
 
     /**
@@ -110,7 +161,42 @@ public class DocumentManager {
         }
 
         public CompletableFuture<DocumentProcessingResult> requestDocument(String documentName) {
-            return documents.computeIfAbsent(documentName, doc -> manager.requestDocument(this, doc));
+            while (true) {
+                CompletableFuture<DocumentProcessingResult> existing = documents.get(documentName);
+                if (existing != null) {
+                    return existing;
+                }
+                CompletableFuture<DocumentProcessingResult> placeholder = new CompletableFuture<>();
+                CompletableFuture<DocumentProcessingResult> previous = documents.putIfAbsent(documentName, placeholder);
+                if (previous == null) {
+                    manager.scheduleDocument(this, documentName).whenComplete((result, error) -> {
+                        if (error != null) {
+                            placeholder.completeExceptionally(error);
+                        } else {
+                            placeholder.complete(result);
+                        }
+                    });
+                    return placeholder;
+                }
+            }
+        }
+
+        boolean hasDocument(String documentName) {
+            CompletableFuture<DocumentProcessingResult> future = documents.get(documentName);
+            return future != null && future.isDone() && !future.isCompletedExceptionally();
+        }
+    }
+
+    private static final class MissingDependenciesException extends Exception {
+        private final List<String> missing;
+
+        MissingDependenciesException(List<String> missing) {
+            super("Missing dependencies: " + missing);
+            this.missing = List.copyOf(missing);
+        }
+
+        List<String> getMissing() {
+            return missing;
         }
     }
 }

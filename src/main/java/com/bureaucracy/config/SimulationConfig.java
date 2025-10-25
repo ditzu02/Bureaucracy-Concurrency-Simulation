@@ -54,20 +54,20 @@ public final class SimulationConfig {
      */
     public static SimulationConfig sample() {
         List<OfficeConfig> offices = List.of(
-                new OfficeConfig("Identity Office", 2, Duration.ofSeconds(1), Duration.ofSeconds(3), Duration.ofSeconds(6)),
-                new OfficeConfig("Tax Agency", 2, Duration.ofSeconds(2), Duration.ofSeconds(4), Duration.ofSeconds(7)),
-                new OfficeConfig("City Hall", 3, Duration.ofSeconds(2), Duration.ofSeconds(5), Duration.ofSeconds(8)),
-                new OfficeConfig("Health Services", 2, Duration.ofSeconds(1), Duration.ofSeconds(3), Duration.ofSeconds(6))
+                new OfficeConfig("Directia Evidenta Populatiei", 3, Duration.ofSeconds(1), Duration.ofSeconds(3), Duration.ofSeconds(6)),
+                new OfficeConfig("Administratia Fiscala Sector 1", 2, Duration.ofSeconds(1), Duration.ofSeconds(3), Duration.ofSeconds(7)),
+                new OfficeConfig("Primaria Municipiului Bucuresti", 2, Duration.ofSeconds(2), Duration.ofSeconds(4), Duration.ofSeconds(8)),
+                new OfficeConfig("Casa Nationala de Asigurari", 2, Duration.ofSeconds(1), Duration.ofSeconds(3), Duration.ofSeconds(6))
         );
 
         List<DocumentConfig> documents = List.of(
-                new DocumentConfig("ID_FORM", "Identity Office", List.of()),
-                new DocumentConfig("CITIZEN_CARD", "Identity Office", List.of("ID_FORM")),
-                new DocumentConfig("TAX_ID", "Tax Agency", List.of("ID_FORM")),
-                new DocumentConfig("TAX_CLEARANCE", "Tax Agency", List.of("TAX_ID")),
-                new DocumentConfig("HEALTH_INSURANCE", "Health Services", List.of("ID_FORM")),
-                new DocumentConfig("RESIDENCY_CERT", "City Hall", List.of("CITIZEN_CARD", "TAX_CLEARANCE")),
-                new DocumentConfig("BUSINESS_LICENSE", "City Hall", List.of("RESIDENCY_CERT", "TAX_CLEARANCE", "HEALTH_INSURANCE"))
+                new DocumentConfig("CERERE_CI", "Directia Evidenta Populatiei", List.of()),
+                new DocumentConfig("CARTE_IDENTITATE", "Directia Evidenta Populatiei", List.of("CERERE_CI")),
+                new DocumentConfig("NUMAR_FISCAL", "Administratia Fiscala Sector 1", List.of("CARTE_IDENTITATE")),
+                new DocumentConfig("CERTIFICAT_FISCAL", "Administratia Fiscala Sector 1", List.of("NUMAR_FISCAL")),
+                new DocumentConfig("CARD_SANATATE", "Casa Nationala de Asigurari", List.of("CARTE_IDENTITATE")),
+                new DocumentConfig("ADEVERINTA_DOMICILIU", "Primaria Municipiului Bucuresti", List.of("CARTE_IDENTITATE", "CERTIFICAT_FISCAL")),
+                new DocumentConfig("AVIZ_AFACERI", "Primaria Municipiului Bucuresti", List.of("ADEVERINTA_DOMICILIU", "CERTIFICAT_FISCAL", "CARD_SANATATE"))
         );
 
         return new SimulationConfig(offices, documents);

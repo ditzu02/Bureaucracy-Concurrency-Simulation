@@ -9,42 +9,41 @@ import java.util.Deque;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Models an office with one or more counters that process incoming clients sequentially,
  * while supporting temporary pauses (coffee breaks) and providing status inspection.
+ *
+ * The implementation purposefully sticks to classic concurrency primitives (synchronized,
+ * wait/notify, latches) to keep the flow approachable and easy to reason about.
  */
 public class Office {
 
     private final String name;
     private final SimulationConfig.OfficeConfig config;
-    private final OfficeEventListener eventListener;
+    private final SimulationReporter reporter;
 
-    private static final ThreadLocal<Office> COUNTER_CONTEXT = new ThreadLocal<>();
-
-    private final ReentrantLock lock = new ReentrantLock();
-    private final Condition queueAvailable = lock.newCondition();
-    private final Condition stateChanged = lock.newCondition();
     private final Deque<OfficeQueueEntry> queue = new ArrayDeque<>();
     private final List<Thread> counters = new ArrayList<>();
     private final AtomicInteger taskSequence = new AtomicInteger(0);
+    private final Object monitor = new Object();
+    private final Semaphore breakSemaphore = new Semaphore(1, true);
 
     private boolean accepting = true;
     private boolean breakRequested = false;
     private boolean onBreak = false;
     private boolean shutdown = false;
     private int activeServices = 0;
+    private CountDownLatch breakLatch;
 
-    public Office(SimulationConfig.OfficeConfig config, OfficeEventListener eventListener) {
+    public Office(SimulationConfig.OfficeConfig config, SimulationReporter reporter) {
         this.name = Objects.requireNonNull(config, "config").getName();
         this.config = config;
-        this.eventListener = eventListener != null ? eventListener : (office, message) -> {
-        };
+        this.reporter = reporter;
         startCounters();
         log("Office opened with " + config.getCounters() + " counters");
     }
@@ -54,8 +53,7 @@ public class Office {
     }
 
     public OfficeState getState() {
-        lock.lock();
-        try {
+        synchronized (monitor) {
             if (shutdown) {
                 return OfficeState.SHUTDOWN;
             }
@@ -66,31 +64,21 @@ public class Office {
                 return OfficeState.BREAK_PENDING;
             }
             return OfficeState.OPEN;
-        } finally {
-            lock.unlock();
         }
     }
 
     public int queueSize() {
-        lock.lock();
-        try {
+        synchronized (monitor) {
             return queue.size();
-        } finally {
-            lock.unlock();
         }
     }
 
     public CompletableFuture<DocumentProcessingResult> submit(IssuanceTask task) throws InterruptedException {
         Objects.requireNonNull(task, "task");
 
-        if (COUNTER_CONTEXT.get() == this) {
-            return processInline(task);
-        }
-
-        lock.lockInterruptibly();
-        try {
-            while (!shutdown && !accepting) {
-                stateChanged.await();
+        synchronized (monitor) {
+            while (!accepting && !shutdown) {
+                monitor.wait();
             }
             if (shutdown) {
                 throw new IllegalStateException("Office " + name + " is shutting down");
@@ -98,12 +86,9 @@ public class Office {
 
             OfficeQueueEntry entry = new OfficeQueueEntry(task, taskSequence.incrementAndGet());
             queue.addLast(entry);
-            queueAvailable.signal();
-            log("Queued task #" + entry.sequence + " for " + task.getCustomerId() + " requesting " + task.getDocumentName() +
-                    " (queue size=" + queue.size() + ")");
+            monitor.notifyAll();
+            reporter.queueEvent(name, task.getCustomerId(), task.getDocumentName(), snapshotQueue());
             return entry.completion;
-        } finally {
-            lock.unlock();
         }
     }
 
@@ -111,26 +96,24 @@ public class Office {
         if (config.getBreakDuration().isZero()) {
             return;
         }
-        beginBreak();
+        breakSemaphore.acquire();
         try {
+            beginBreak();
             log("Coffee break started for " + config.getBreakDuration().toSeconds() + " seconds");
             Thread.sleep(config.getBreakDuration().toMillis());
         } finally {
             endBreak();
+            breakSemaphore.release();
         }
     }
 
     public void shutdown() {
-        lock.lock();
-        try {
+        synchronized (monitor) {
             if (shutdown) {
                 return;
             }
             shutdown = true;
-            queueAvailable.signalAll();
-            stateChanged.signalAll();
-        } finally {
-            lock.unlock();
+            monitor.notifyAll();
         }
 
         for (Thread counter : counters) {
@@ -152,53 +135,54 @@ public class Office {
     }
 
     private void beginBreak() throws InterruptedException {
-        lock.lockInterruptibly();
-        try {
+        CountDownLatch latchToAwait = null;
+        synchronized (monitor) {
             if (shutdown) {
                 return;
             }
-            if (!accepting && (breakRequested || onBreak)) {
+            if (breakRequested || onBreak) {
                 while (!onBreak && !shutdown) {
-                    stateChanged.await();
+                    monitor.wait();
                 }
                 return;
             }
             accepting = false;
             breakRequested = true;
             log("Coffee break requested");
-            queueAvailable.signalAll();
-            if (activeServices == 0 && queue.isEmpty()) {
-                enterBreakMode();
+            if (activeServices == 0) {
+                enterBreakModeLocked();
+            } else {
+                log("Waiting for " + activeServices + " active service(s) to finish before break");
+                breakLatch = new CountDownLatch(activeServices);
+                latchToAwait = breakLatch;
             }
-            while (!onBreak && !shutdown) {
-                stateChanged.await();
+        }
+        if (latchToAwait != null) {
+            latchToAwait.await();
+            synchronized (monitor) {
+                enterBreakModeLocked();
             }
-        } finally {
-            lock.unlock();
         }
     }
 
     private void endBreak() {
-        lock.lock();
-        try {
+        synchronized (monitor) {
             if (shutdown) {
                 return;
             }
             onBreak = false;
             accepting = true;
             log("Coffee break ended, office is now OPEN");
-            queueAvailable.signalAll();
-            stateChanged.signalAll();
-        } finally {
-            lock.unlock();
+            monitor.notifyAll();
         }
     }
 
-    private void enterBreakMode() {
+    private void enterBreakModeLocked() {
         onBreak = true;
         breakRequested = false;
+        breakLatch = null;
         log("Office is now ON_BREAK");
-        stateChanged.signalAll();
+        monitor.notifyAll();
     }
 
     private void startCounters() {
@@ -211,21 +195,16 @@ public class Office {
     }
 
     private void counterLoop(int counterIndex) {
-        COUNTER_CONTEXT.set(this);
         try {
             while (true) {
                 OfficeQueueEntry entry;
-                lock.lock();
-                try {
-                    while (!shutdown && (queue.isEmpty() || onBreak)) {
+                synchronized (monitor) {
+                    while (!shutdown && (queue.isEmpty() || onBreak || breakRequested)) {
                         if (shutdown) {
                             return;
                         }
-                        if (breakRequested && activeServices == 0 && queue.isEmpty()) {
-                            enterBreakMode();
-                        }
                         try {
-                            queueAvailable.await(200, TimeUnit.MILLISECONDS);
+                            monitor.wait();
                         } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
                             return;
@@ -236,13 +215,13 @@ public class Office {
                     }
                     entry = queue.removeFirst();
                     activeServices++;
-                } finally {
-                    lock.unlock();
+                    reporter.arrivalEvent(name, counterIndex, entry.task.getCustomerId(), entry.task.getDocumentName());
                 }
 
                 try {
                     DocumentProcessingResult result = executeTask(entry.task);
                     entry.completion.complete(result);
+                    reporter.finishEvent(name, counterIndex, entry.task.getCustomerId(), entry.task.getDocumentName());
                     log("Completed task #" + entry.sequence + " for " + entry.task.getCustomerId() +
                             " (" + entry.task.getDocumentName() + ") in " + result.getServiceDuration().toMillis() + " ms");
                 } catch (InterruptedException e) {
@@ -252,38 +231,18 @@ public class Office {
                 } catch (Exception e) {
                     entry.completion.completeExceptionally(e);
                 } finally {
-                    lock.lock();
-                    try {
+                    synchronized (monitor) {
                         activeServices--;
-                        if (breakRequested && activeServices == 0 && queue.isEmpty()) {
-                            enterBreakMode();
-                        } else {
-                            queueAvailable.signal();
+                        if (breakLatch != null) {
+                            breakLatch.countDown();
                         }
-                    } finally {
-                        lock.unlock();
+                        monitor.notifyAll();
                     }
                 }
             }
         } finally {
-            COUNTER_CONTEXT.remove();
+            // nothing to clean up
         }
-    }
-
-    private CompletableFuture<DocumentProcessingResult> processInline(IssuanceTask task) {
-        CompletableFuture<DocumentProcessingResult> future = new CompletableFuture<>();
-        try {
-            DocumentProcessingResult result = executeTask(task);
-            log("Completed inline task for " + task.getCustomerId() +
-                    " (" + task.getDocumentName() + ") in " + result.getServiceDuration().toMillis() + " ms");
-            future.complete(result);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            future.completeExceptionally(e);
-        } catch (Exception e) {
-            future.completeExceptionally(e);
-        }
-        return future;
     }
 
     private DocumentProcessingResult executeTask(IssuanceTask task) throws Exception {
@@ -304,7 +263,15 @@ public class Office {
     }
 
     private void log(String message) {
-        eventListener.onEvent(name, message);
+        reporter.onEvent(name, message);
+    }
+
+    private List<String> snapshotQueue() {
+        List<String> snapshot = new ArrayList<>();
+        for (OfficeQueueEntry entry : queue) {
+            snapshot.add("person " + entry.task.getCustomerId() + " REQUESTING " + entry.task.getDocumentName());
+        }
+        return snapshot;
     }
 
     private static final class OfficeQueueEntry {
@@ -317,4 +284,5 @@ public class Office {
             this.sequence = sequence;
         }
     }
+
 }
