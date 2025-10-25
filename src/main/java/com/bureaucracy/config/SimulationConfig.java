@@ -54,10 +54,10 @@ public final class SimulationConfig {
      */
     public static SimulationConfig sample() {
         List<OfficeConfig> offices = List.of(
-                new OfficeConfig("Directia Evidenta Populatiei", 3, Duration.ofSeconds(1), Duration.ofSeconds(3), Duration.ofSeconds(6)),
-                new OfficeConfig("Administratia Fiscala Sector 1", 2, Duration.ofSeconds(1), Duration.ofSeconds(3), Duration.ofSeconds(7)),
-                new OfficeConfig("Primaria Municipiului Bucuresti", 2, Duration.ofSeconds(2), Duration.ofSeconds(4), Duration.ofSeconds(8)),
-                new OfficeConfig("Casa Nationala de Asigurari", 2, Duration.ofSeconds(1), Duration.ofSeconds(3), Duration.ofSeconds(6))
+                new OfficeConfig("Directia Evidenta Populatiei", 3, Duration.ofMillis(400), Duration.ofMillis(900), Duration.ofSeconds(3)),
+                new OfficeConfig("Administratia Fiscala Sector 1", 3, Duration.ofMillis(450), Duration.ofMillis(1000), Duration.ofSeconds(4)),
+                new OfficeConfig("Primaria Municipiului Bucuresti", 3, Duration.ofMillis(500), Duration.ofMillis(1100), Duration.ofSeconds(5)),
+                new OfficeConfig("Casa Nationala de Asigurari", 2, Duration.ofMillis(400), Duration.ofMillis(900), Duration.ofSeconds(3))
         );
 
         List<DocumentConfig> documents = List.of(

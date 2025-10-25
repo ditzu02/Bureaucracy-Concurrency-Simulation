@@ -52,8 +52,8 @@ public final class BureaucracySimulation implements AutoCloseable {
     }
 
     private void scheduleNextBreak(Office office) {
-        Duration minDelay = Duration.ofSeconds(20);
-        Duration maxDelay = Duration.ofSeconds(35);
+        Duration minDelay = Duration.ofSeconds(6);
+        Duration maxDelay = Duration.ofSeconds(10);
         long delay = ThreadLocalRandom.current().nextLong(minDelay.toMillis(), maxDelay.toMillis());
         breakScheduler.schedule(() -> {
             try {

@@ -46,6 +46,9 @@ public final class ConsoleSimulationReporter implements SimulationReporter {
 
     @Override
     public void systemEvent(String message) {
+        if (message.startsWith("COFFEE BREAK")) {
+            printToConsole(message);
+        }
         writeToFile("SYS", message);
     }
 

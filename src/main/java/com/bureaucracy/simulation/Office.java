@@ -99,7 +99,9 @@ public class Office {
         breakSemaphore.acquire();
         try {
             beginBreak();
-            log("Coffee break started for " + config.getBreakDuration().toSeconds() + " seconds");
+            long millis = config.getBreakDuration().toMillis();
+            String message = "COFFEE BREAK at " + name + " for " + millis + " ms";
+            reporter.systemEvent(message);
             Thread.sleep(config.getBreakDuration().toMillis());
         } finally {
             endBreak();
@@ -173,6 +175,7 @@ public class Office {
             onBreak = false;
             accepting = true;
             log("Coffee break ended, office is now OPEN");
+            reporter.onEvent(name, "Counters back from coffee break");
             monitor.notifyAll();
         }
     }
@@ -182,6 +185,7 @@ public class Office {
         breakRequested = false;
         breakLatch = null;
         log("Office is now ON_BREAK");
+        reporter.onEvent(name, "Counters on coffee break");
         monitor.notifyAll();
     }
 
@@ -220,8 +224,8 @@ public class Office {
 
                 try {
                     DocumentProcessingResult result = executeTask(entry.task);
-                    entry.completion.complete(result);
                     reporter.finishEvent(name, counterIndex, entry.task.getCustomerId(), entry.task.getDocumentName());
+                    entry.completion.complete(result);
                     log("Completed task #" + entry.sequence + " for " + entry.task.getCustomerId() +
                             " (" + entry.task.getDocumentName() + ") in " + result.getServiceDuration().toMillis() + " ms");
                 } catch (InterruptedException e) {
